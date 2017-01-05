@@ -16,7 +16,7 @@ through several stages:
 
 1. Decoding (Identifying what type of instruction it is and breaking it up into fields)
 2. Translation (Generation of high-level IR from the instruction)
-3. Optimization (Eliminiation of redundant microinstructions, other speed improvements)
+3. Optimization (Elimination of redundant microinstructions, other speed improvements)
 4. Emission (Generation of host-executable code into memory)
 5. Execution (Host CPU jumps to the start of emitted code and runs it)
 
