@@ -6,6 +6,8 @@
 
 #include <unordered_map>
 
+#include <dynarmic/coprocessor.h>
+
 #include "backend_x64/abi.h"
 #include "backend_x64/block_of_code.h"
 #include "backend_x64/emit_x64.h"
@@ -1273,26 +1275,6 @@ void EmitX64::EmitCountLeadingZeros(IR::Block&, IR::Inst* inst) {
         code->neg(result);
         code->add(result, 31);
     }
-}
-
-void EmitX64::EmitNegateLowWord(IR::Block&, IR::Inst* inst) {
-    IR::Value a = inst->GetArg(0);
-
-    Xbyak::Reg32 result = reg_alloc.UseDefGpr(a, inst).cvt32();
-
-    code->ror(result, 16);
-    code->xor(result, 0xFFFF0000);
-    code->add(result, 0x00010000);
-    code->ror(result, 16);
-}
-
-void EmitX64::EmitNegateHighWord(IR::Block&, IR::Inst* inst) {
-    IR::Value a = inst->GetArg(0);
-
-    Xbyak::Reg32 result = reg_alloc.UseDefGpr(a, inst).cvt32();
-
-    code->xor(result, 0xFFFF0000);
-    code->add(result, 0x00010000);
 }
 
 void EmitX64::EmitSignedSaturatedAdd(IR::Block& block, IR::Inst* inst) {
@@ -2973,6 +2955,270 @@ void EmitX64::EmitExclusiveWriteMemory64(IR::Block&, IR::Inst* inst) {
     code->CallFunction(cb.MemoryWrite64);
     code->xor_(passed, passed);
     code->L(end);
+}
+
+static void EmitCoprocessorException() {
+    ASSERT_MSG(false, "Should raise coproc exception here");
+}
+
+static void CallCoprocCallback(BlockOfCode* code, RegAlloc& reg_alloc, Jit* jit_interface, Coprocessor::Callback callback, IR::Inst* inst = nullptr, IR::Value arg0 = {}, IR::Value arg1 = {}) {
+    reg_alloc.HostCall(inst, {}, {}, arg0, arg1);
+
+    code->mov(code->ABI_PARAM1, reinterpret_cast<u64>(jit_interface));
+    if (callback.user_arg) {
+        code->mov(code->ABI_PARAM2, reinterpret_cast<u64>(*callback.user_arg));
+    }
+
+    code->CallFunction(callback.function);
+}
+
+void EmitX64::EmitCoprocInternalOperation(IR::Block&, IR::Inst* inst) {
+    auto coproc_info = inst->GetArg(0).GetCoprocInfo();
+
+    size_t coproc_num = coproc_info[0];
+    bool two = coproc_info[1] != 0;
+    unsigned opc1 = static_cast<unsigned>(coproc_info[2]);
+    Arm::CoprocReg CRd = static_cast<Arm::CoprocReg>(coproc_info[3]);
+    Arm::CoprocReg CRn = static_cast<Arm::CoprocReg>(coproc_info[4]);
+    Arm::CoprocReg CRm = static_cast<Arm::CoprocReg>(coproc_info[5]);
+    unsigned opc2 = static_cast<unsigned>(coproc_info[6]);
+
+    std::shared_ptr<Coprocessor> coproc = cb.coprocessors[coproc_num];
+    if (!coproc) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    auto action = coproc->CompileInternalOperation(two, opc1, CRd, CRn, CRm, opc2);
+    if (!action) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    CallCoprocCallback(code, reg_alloc, jit_interface, *action);
+}
+
+void EmitX64::EmitCoprocSendOneWord(IR::Block&, IR::Inst* inst) {
+    auto coproc_info = inst->GetArg(0).GetCoprocInfo();
+
+    size_t coproc_num = coproc_info[0];
+    bool two = coproc_info[1] != 0;
+    unsigned opc1 = static_cast<unsigned>(coproc_info[2]);
+    Arm::CoprocReg CRn = static_cast<Arm::CoprocReg>(coproc_info[3]);
+    Arm::CoprocReg CRm = static_cast<Arm::CoprocReg>(coproc_info[4]);
+    unsigned opc2 = static_cast<unsigned>(coproc_info[5]);
+
+    IR::Value word = inst->GetArg(1);
+
+    std::shared_ptr<Coprocessor> coproc = cb.coprocessors[coproc_num];
+    if (!coproc) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    auto action = coproc->CompileSendOneWord(two, opc1, CRn, CRm, opc2);
+    switch (action.which()) {
+    case 0:
+        EmitCoprocessorException();
+        return;
+    case 1:
+        CallCoprocCallback(code, reg_alloc, jit_interface, boost::get<Coprocessor::Callback>(action), nullptr, word);
+        return;
+    case 2: {
+        u32* destination_ptr = boost::get<u32*>(action);
+
+        Xbyak::Reg32 reg_word = reg_alloc.UseGpr(word).cvt32();
+        Xbyak::Reg64 reg_destination_addr = reg_alloc.ScratchGpr();
+
+        code->mov(reg_destination_addr, reinterpret_cast<u64>(destination_ptr));
+        code->mov(code->dword[reg_destination_addr], reg_word);
+
+        return;
+    }
+    default:
+        ASSERT_MSG(false, "Unreachable");
+    }
+}
+
+void EmitX64::EmitCoprocSendTwoWords(IR::Block&, IR::Inst* inst) {
+    auto coproc_info = inst->GetArg(0).GetCoprocInfo();
+
+    size_t coproc_num = coproc_info[0];
+    bool two = coproc_info[1] != 0;
+    unsigned opc = static_cast<unsigned>(coproc_info[2]);
+    Arm::CoprocReg CRm = static_cast<Arm::CoprocReg>(coproc_info[3]);
+
+    IR::Value word1 = inst->GetArg(1);
+    IR::Value word2 = inst->GetArg(2);
+
+    std::shared_ptr<Coprocessor> coproc = cb.coprocessors[coproc_num];
+    if (!coproc) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    auto action = coproc->CompileSendTwoWords(two, opc, CRm);
+    switch (action.which()) {
+    case 0:
+        EmitCoprocessorException();
+        return;
+    case 1:
+        CallCoprocCallback(code, reg_alloc, jit_interface, boost::get<Coprocessor::Callback>(action), nullptr, word1, word2);
+        return;
+    case 2: {
+        auto destination_ptrs = boost::get<std::array<u32*, 2>>(action);
+
+        Xbyak::Reg32 reg_word1 = reg_alloc.UseGpr(word1).cvt32();
+        Xbyak::Reg32 reg_word2 = reg_alloc.UseGpr(word2).cvt32();
+        Xbyak::Reg64 reg_destination_addr = reg_alloc.ScratchGpr();
+
+        code->mov(reg_destination_addr, reinterpret_cast<u64>(destination_ptrs[0]));
+        code->mov(code->dword[reg_destination_addr], reg_word1);
+        code->mov(reg_destination_addr, reinterpret_cast<u64>(destination_ptrs[1]));
+        code->mov(code->dword[reg_destination_addr], reg_word2);
+
+        return;
+    }
+    default:
+        ASSERT_MSG(false, "Unreachable");
+    }
+}
+
+void EmitX64::EmitCoprocGetOneWord(IR::Block&, IR::Inst* inst) {
+    auto coproc_info = inst->GetArg(0).GetCoprocInfo();
+
+    size_t coproc_num = coproc_info[0];
+    bool two = coproc_info[1] != 0;
+    unsigned opc1 = static_cast<unsigned>(coproc_info[2]);
+    Arm::CoprocReg CRn = static_cast<Arm::CoprocReg>(coproc_info[3]);
+    Arm::CoprocReg CRm = static_cast<Arm::CoprocReg>(coproc_info[4]);
+    unsigned opc2 = static_cast<unsigned>(coproc_info[5]);
+
+    std::shared_ptr<Coprocessor> coproc = cb.coprocessors[coproc_num];
+    if (!coproc) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    auto action = coproc->CompileGetOneWord(two, opc1, CRn, CRm, opc2);
+    switch (action.which()) {
+    case 0:
+        EmitCoprocessorException();
+        return;
+    case 1:
+        CallCoprocCallback(code, reg_alloc, jit_interface, boost::get<Coprocessor::Callback>(action), inst);
+        return;
+    case 2: {
+        u32* source_ptr = boost::get<u32*>(action);
+
+        Xbyak::Reg32 reg_word = reg_alloc.DefGpr(inst).cvt32();
+        Xbyak::Reg64 reg_source_addr = reg_alloc.ScratchGpr();
+
+        code->mov(reg_source_addr, reinterpret_cast<u64>(source_ptr));
+        code->mov(reg_word, code->dword[reg_source_addr]);
+
+        return;
+    }
+    default:
+        ASSERT_MSG(false, "Unreachable");
+    }
+}
+
+void EmitX64::EmitCoprocGetTwoWords(IR::Block&, IR::Inst* inst) {
+    auto coproc_info = inst->GetArg(0).GetCoprocInfo();
+
+    size_t coproc_num = coproc_info[0];
+    bool two = coproc_info[1] != 0;
+    unsigned opc = coproc_info[2];
+    Arm::CoprocReg CRm = static_cast<Arm::CoprocReg>(coproc_info[3]);
+
+    std::shared_ptr<Coprocessor> coproc = cb.coprocessors[coproc_num];
+    if (!coproc) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    auto action = coproc->CompileGetTwoWords(two, opc, CRm);
+    switch (action.which()) {
+    case 0:
+        EmitCoprocessorException();
+        return;
+    case 1:
+        CallCoprocCallback(code, reg_alloc, jit_interface, boost::get<Coprocessor::Callback>(action), inst);
+        return;
+    case 2: {
+        auto source_ptrs = boost::get<std::array<u32*, 2>>(action);
+
+        Xbyak::Reg64 reg_result = reg_alloc.DefGpr(inst);
+        Xbyak::Reg64 reg_destination_addr = reg_alloc.ScratchGpr();
+        Xbyak::Reg64 reg_tmp = reg_alloc.ScratchGpr();
+
+        code->mov(reg_destination_addr, reinterpret_cast<u64>(source_ptrs[1]));
+        code->mov(reg_result.cvt32(), code->dword[reg_destination_addr]);
+        code->shl(reg_result, 32);
+        code->mov(reg_destination_addr, reinterpret_cast<u64>(source_ptrs[0]));
+        code->mov(reg_tmp.cvt32(), code->dword[reg_destination_addr]);
+        code->or_(reg_result, reg_tmp);
+
+        return;
+    }
+    default:
+        ASSERT_MSG(false, "Unreachable");
+    }
+}
+
+void EmitX64::EmitCoprocLoadWords(IR::Block&, IR::Inst* inst) {
+    auto coproc_info = inst->GetArg(0).GetCoprocInfo();
+
+    size_t coproc_num = coproc_info[0];
+    bool two = coproc_info[1] != 0;
+    bool long_transfer = coproc_info[2] != 0;
+    Arm::CoprocReg CRd = static_cast<Arm::CoprocReg>(coproc_info[3]);
+    bool has_option = coproc_info[4] != 0;
+    boost::optional<u8> option{has_option, coproc_info[5]};
+
+    IR::Value address = inst->GetArg(1);
+
+    std::shared_ptr<Coprocessor> coproc = cb.coprocessors[coproc_num];
+    if (!coproc) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    auto action = coproc->CompileLoadWords(two, long_transfer, CRd, option);
+    if (!action) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    CallCoprocCallback(code, reg_alloc, jit_interface, *action, nullptr, address);
+}
+
+void EmitX64::EmitCoprocStoreWords(IR::Block&, IR::Inst* inst) {
+    auto coproc_info = inst->GetArg(0).GetCoprocInfo();
+
+    size_t coproc_num = coproc_info[0];
+    bool two = coproc_info[1] != 0;
+    bool long_transfer = coproc_info[2] != 0;
+    Arm::CoprocReg CRd = static_cast<Arm::CoprocReg>(coproc_info[3]);
+    bool has_option = coproc_info[4] != 0;
+    boost::optional<u8> option{has_option, coproc_info[5]};
+
+    IR::Value address = inst->GetArg(1);
+
+    std::shared_ptr<Coprocessor> coproc = cb.coprocessors[coproc_num];
+    if (!coproc) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    auto action = coproc->CompileStoreWords(two, long_transfer, CRd, option);
+    if (!action) {
+        EmitCoprocessorException();
+        return;
+    }
+
+    CallCoprocCallback(code, reg_alloc, jit_interface, *action, nullptr, address);
 }
 
 void EmitX64::EmitAddCycles(size_t cycles) {
